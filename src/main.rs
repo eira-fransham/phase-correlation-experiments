@@ -14,21 +14,21 @@ use symphonia::core::{
 /// AltarBoy loops have significant audible phasing without phase alignment,
 /// so act as a good test for the process
 const FILES: &[&str] = &[
-    "AltarBoy Loop -100",
-    "AltarBoy Loop -075",
-    "AltarBoy Loop -050",
-    "AltarBoy Loop -025",
-    "AltarBoy Loop 000",
-    "AltarBoy Loop +025",
-    "AltarBoy Loop +050",
-    "AltarBoy Loop +075",
-    "AltarBoy Loop +100",
+    "Saturn Loop -100",
+    "Saturn Loop -075",
+    "Saturn Loop -050",
+    "Saturn Loop -025",
+    "Saturn Loop 000",
+    "Saturn Loop +025",
+    "Saturn Loop +050",
+    "Saturn Loop +075",
+    "Saturn Loop +100",
 ];
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 enum RadiusWeight {
-    /// Weight = r^2
+    /// Weight = r^2, appears to produce the best results
     #[default]
     Pow,
     /// Weight = r
@@ -45,41 +45,42 @@ fn phase_align(
     signal_spec: SignalSpec,
     weight_mode: RadiusWeight,
 ) {
-    fn calc_phase_offset(fft: &[Complex<f32>], sample_rate: u32, weight_mode: RadiusWeight) -> f64 {
-        let mut weight_total = 0.;
-
-        let sum = fft
-            .iter()
-            .enumerate()
-            .filter_map(|(i, cartesian)| {
-                let cartesian = Complex::new(cartesian.re as f64, cartesian.im as f64);
-                let (r, theta) = cartesian.to_polar();
-
-                // TODO: For `i == 0` this is the DC offset, should we fix DC offset while we're
-                //       doing this.
-                let bin_hz = (i as f64 * sample_rate as f64) / fft.len() as f64;
-
-                let phase = theta;
+    fn calc_weights(
+        fft: &[Complex<f32>],
+        num_files: usize,
+        sample_rate: u32,
+        weight_mode: RadiusWeight,
+        weights: &mut [f64],
+    ) {
+        for chan_buf in fft.chunks_exact(num_files) {
+            for ((i, src), dst) in chan_buf.iter().enumerate().zip(&mut *weights).skip(1) {
+                let bin_freq_seconds = fft.len() as f64 / (i as f64 * sample_rate as f64);
 
                 let weight = match weight_mode {
-                    RadiusWeight::Pow => r.powi(2),
-                    RadiusWeight::Amp => r,
+                    RadiusWeight::Pow => src.norm_sqr() as f64,
+                    RadiusWeight::Amp => src.norm() as f64,
                     RadiusWeight::One => 1.,
                 };
-                let weight = weight / bin_hz;
+                *dst = weight * bin_freq_seconds;
+            }
+        }
+    }
 
-                if phase.is_finite() && weight.is_finite() {
-                    weight_total += weight;
+    fn calc_phase_offset(fft: &[Complex<f32>], weights: &[f64]) -> f64 {
+        let sum = fft
+            .iter()
+            .zip(weights)
+            .map(|(cartesian, weight)| {
+                let cartesian = Complex::new(cartesian.re as f64, cartesian.im as f64);
+                let theta = cartesian.arg();
 
-                    Some(Complex::from_polar(weight, phase))
-                } else {
-                    None
-                }
+                // We calculate an average in cartesian space so -pi and pi don't average to 0
+                Complex::from_polar(*weight, theta)
             })
             .sum::<Complex<f64>>();
-        let (_, average_rotation) = (sum / weight_total as f64).to_polar();
+        let (_, average_theta) = sum.to_polar();
 
-        average_rotation
+        average_theta
     }
 
     fn apply_phase_offset(fft: &mut [Complex<f32>], offset: f64) {
@@ -133,6 +134,16 @@ fn phase_align(
         }
     }
 
+    let mut weights = vec![0f64; samples_per_channel];
+
+    calc_weights(
+        &fft_out_buf,
+        num_files,
+        signal_spec.rate,
+        weight_mode,
+        &mut weights,
+    );
+
     let mut fft_chan_bufs = fft_out_buf.chunks_exact(samples_per_channel);
 
     let mut phases = Vec::with_capacity(num_files);
@@ -144,8 +155,8 @@ fn phase_align(
         };
         let right = fft_chan_bufs.next().unwrap();
 
-        let left_phase = calc_phase_offset(left, signal_spec.rate, weight_mode);
-        let right_phase = calc_phase_offset(right, signal_spec.rate, weight_mode);
+        let left_phase = calc_phase_offset(left, &weights);
+        let right_phase = calc_phase_offset(right, &weights);
 
         let avg_phase = (left_phase + right_phase) / 2.;
 
@@ -357,7 +368,7 @@ fn main() {
         .map(|chunk| min_max(chunk))
         .collect::<Vec<_>>();
 
-    phase_align(&mut samples, num_files, spec, RadiusWeight::Amp);
+    phase_align(&mut samples, num_files, spec, RadiusWeight::Pow);
 
     // Remap each buffer back to its original range after phase alignment
     for (file, (min, max)) in samples.chunks_exact_mut(samples_per_file).zip(mins_maxs) {
