@@ -1,0 +1,10 @@
+[package]
+name = "phase-alignment-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+symphonia = "0.5"
+rodio = { version = "0.21", features = ["wav_output"] }
+rustfft = "6.4"
+num-traits = "0.2"
