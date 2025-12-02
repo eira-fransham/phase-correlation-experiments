@@ -1,3 +1,19 @@
+//! # Automatic phase alignment
+//!
+//! Testbed for FFT-based offline automatic phase alignment, designed for correlated
+//! signals that were processed with effects that cause different phasing for
+//! different parameters.
+//!
+//! ## Usecases:
+//!
+//! - More-seamless crossfading between samples (see `MultiCrossfader`).
+//! - Delta compression - i.e. use a lossy, high-channel-count format like Opus and
+//!   only store a limited number of full-quality channels, with the intermediate
+//!   samples being stored as a diff. If the samples are highly correlated this means
+//!   that the full-quality channels can get a much higher proportion of the allocated
+//!   bitrate for that block, with the delta channels being possible to serialise at a
+//!   lower bitrate.
+
 use std::num::NonZeroUsize;
 use std::ops::{Add, Div, Mul, Sub};
 use std::time::Duration;
