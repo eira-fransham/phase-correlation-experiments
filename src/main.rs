@@ -12,24 +12,22 @@ use symphonia::core::{
     probe::Hint,
 };
 
-/// AltarBoy loops have significant audible phasing without phase alignment,
-/// so act as a good test for the process
 const FILES: &[&str] = &[
-    "AltarBoy Loop -100",
-    "AltarBoy Loop -075",
-    "AltarBoy Loop -050",
-    "AltarBoy Loop -025",
-    "AltarBoy Loop 000",
-    "AltarBoy Loop +025",
-    "AltarBoy Loop +050",
-    "AltarBoy Loop +075",
-    "AltarBoy Loop +100",
+    "Saturn Loop -100",
+    "Saturn Loop -075",
+    "Saturn Loop -050",
+    "Saturn Loop -025",
+    "Saturn Loop 000",
+    "Saturn Loop +025",
+    "Saturn Loop +050",
+    "Saturn Loop +075",
+    "Saturn Loop +100",
 ];
 
-struct WeightStrategy {
-    in_range: Range<f64>,
-    out_range: Range<f64>,
-    exp: f64,
+pub struct WeightStrategy {
+    pub in_range: Range<f64>,
+    pub out_range: Range<f64>,
+    pub exp: f64,
 }
 
 impl WeightStrategy {
@@ -54,27 +52,54 @@ impl WeightStrategy {
     }
 }
 
-struct Weights {
-    freq: WeightStrategy,
-    radius: WeightStrategy,
+pub struct Weights {
+    pub freq: WeightStrategy,
+    pub radius: WeightStrategy,
+    // TODO: Implement this, same as for midpoints
+    // channel_calc: ChannelCalc,
     /// The number of primary features to detect (if `None`, use all buckets)
-    limit_features: Option<NonZeroUsize>,
+    pub limit_features: Option<NonZeroUsize>,
 }
 
-struct ChanFmt {
-    idx: usize,
-    total: usize,
+pub enum RealignMask {
+    /// Align each bucket based on its calculated weight (before feature limiting).
+    /// Causes changes in timbre but can reduce the chance of phase alignment making
+    /// phasing worse.
+    Weighted,
+    /// Only change the phase of the major features (see `Weights.limit_features`).
+    FeaturesOnly,
+    /// Align all buckets by the same amount. Should not affect the sound of the effect
+    /// at all, but may cause unwanted artifacts when crossfading noisier effects.
+    Transparent,
 }
 
-impl std::fmt::Display for ChanFmt {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (self.total, self.idx) {
-            (1, _) => write!(f, "mono"),
-            (2, 0) => write!(f, "mid "),
-            (2, 1) => write!(f, "side"),
-            _ => write!(f, "ch{} ", self.idx),
-        }
-    }
+pub enum ChannelCalc {
+    /// Only calculate the phasing midpoint based on a certain channel idx. Useful
+    /// if some phasing on the side channel is acceptable.
+    OneChannel(usize),
+    /// Calculate the midpoint across all channels. Avoids introducing phasing
+    /// between channels while still accounting for the phase of all channels.
+    Combined,
+    /// Calculate a separate midpoint for each channel. May introduce phasing
+    /// between channels.
+    Separate,
+}
+
+pub struct AlignConfig {
+    pub weights: Weights,
+    /// TODO: I think `Transparent` is really the only option that makes sense for this, it
+    /// can probably be removed.
+    pub realign_mask: RealignMask,
+    pub midpoint_calc: ChannelCalc,
+    /// If input channel count is 2, this specifies if mid/side or left/right processing should
+    /// be used.
+    pub process_mode: Option<TwoChannelProcessMode>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum TwoChannelProcessMode {
+    MidSide,
+    Stereo,
 }
 
 /// Given a flat buffer of interleaved samples with a format given by `signal_spec`, align the
@@ -82,12 +107,82 @@ impl std::fmt::Display for ChanFmt {
 ///
 /// This processes the buffer as mid/side rather than left/right to prevent unwanted panning
 /// if the buffers end up more phased than before.
-fn phase_align(
+///
+/// ### Possible improvements
+///
+/// - Maybe for each pair of buffers we can "slide" the phase (either in N linear steps, via
+///   binary search, or some combination) between the midpoint and its unmodified phase, choosing
+///   the option which minimises error. The number of permutations needed to do this perfectly
+///   would be extremely high, though, as the error needs to be optimised between each pair of
+///   neighbours (and each sample has two neighbours). This would reduce the chance of alignment
+///   actually increasing the overall amount of phasing.
+/// - We could probably try multiple different configs, checking the error and choosing the one
+///   that works the best automatically. The process is surprisingly fast, so we probably have
+///   the performance budget for it.
+pub fn phase_align(
     concat_samples: &mut [f32],
     num_files: usize,
     signal_spec: SignalSpec,
-    weight_mode: &Weights,
+    config: &AlignConfig,
 ) {
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    enum ChanCount {
+        Stereo,
+        MidSide,
+        Count(usize),
+    }
+
+    struct ChanFmt {
+        idx: usize,
+        total: ChanCount,
+    }
+
+    impl std::fmt::Display for ChanFmt {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match (self.total, self.idx) {
+                (ChanCount::Count(1), _) => write!(f, "mono"),
+                (ChanCount::MidSide, 0) => write!(f, "mid "),
+                (ChanCount::MidSide, 1) => write!(f, "side"),
+                (ChanCount::Stereo, 0) => write!(f, "left "),
+                (ChanCount::Stereo, 1) => write!(f, "right"),
+                _ => write!(f, "ch{} ", self.idx),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum Midpoints {
+        OneChannel(usize, f64),
+        Combined(usize, f64),
+        Separate(Vec<f64>),
+    }
+
+    impl Midpoints {
+        fn new(num_channels: usize, config: &ChannelCalc) -> Self {
+            match config {
+                ChannelCalc::OneChannel(chan) => Midpoints::OneChannel(*chan, 0.),
+                ChannelCalc::Combined => Midpoints::Combined(num_channels, 0.),
+                ChannelCalc::Separate => Midpoints::Separate(vec![0.; num_channels]),
+            }
+        }
+
+        fn add(&mut self, chan: usize, amt: f64) {
+            match self {
+                Self::OneChannel(filter_chan, acc) if chan == *filter_chan => *acc += amt,
+                Self::OneChannel(_, _) => {}
+                Self::Combined(count, acc) => *acc += amt / *count as f64,
+                Self::Separate(items) => items[chan] += amt / items.len() as f64,
+            }
+        }
+
+        fn get(&self, chan: usize) -> f64 {
+            match self {
+                Self::OneChannel(_, amt) | Self::Combined(_, amt) => *amt,
+                Self::Separate(items) => items[chan],
+            }
+        }
+    }
+
     /// Either LR->MS or MS->LR, the function is its own inverse. Variable names
     /// are chosen based on LR->MS.
     fn mid_side_convert<'a>(frames: impl IntoIterator<Item = (&'a mut f32, &'a mut f32)>) {
@@ -130,6 +225,11 @@ fn phase_align(
     }
 
     /// Calculate weights, either for a single buffer or for a collection of buffers
+    ///
+    /// # Returns
+    ///
+    /// If configured to limit to the top N weights, will return a vector of indices to
+    /// the top N weights.
     fn calc_weights<'a>(
         fft: impl IntoIterator<Item = &'a [Complex<f32>]>,
         weights: &mut [f64],
@@ -165,8 +265,10 @@ fn phase_align(
                     .reverse()
             });
 
-            for i in &indices[nth_highest.get()..] {
-                weights[*i] = 0.;
+            let max_weight = weights[indices[0]];
+
+            for weight in weights.iter_mut() {
+                *weight /= max_weight;
             }
 
             indices.truncate(nth_highest.get());
@@ -195,10 +297,13 @@ fn phase_align(
         average_theta
     }
 
-    fn apply_phase_offset(fft: &mut [Complex<f32>], offset: f32) {
-        for src_cartesian in fft {
+    fn apply_phase_offset<'a>(
+        iter: impl Iterator<Item = (&'a mut Complex<f32>, &'a f64)>,
+        offset: f32,
+    ) {
+        for (src_cartesian, weight) in iter {
             let (r, theta) = src_cartesian.to_polar();
-            *src_cartesian = Complex::from_polar(r, theta + offset);
+            *src_cartesian = Complex::from_polar(r, theta + offset * *weight as f32);
         }
     }
 
@@ -226,11 +331,16 @@ fn phase_align(
     }
 
     let num_channels = signal_spec.channels.count();
+    let fmt_chan_count = match (num_channels, config.process_mode) {
+        (2, Some(TwoChannelProcessMode::MidSide)) => ChanCount::MidSide,
+        (2, Some(TwoChannelProcessMode::Stereo)) => ChanCount::Stereo,
+        (n, _) => ChanCount::Count(n),
+    };
     let samples_per_file = concat_samples.len() / num_files;
 
     let samples_per_channel = samples_per_file / num_channels;
 
-    if num_channels == 2 {
+    if num_channels == 2 && matches!(config.process_mode, Some(TwoChannelProcessMode::MidSide)) {
         for file in concat_samples.chunks_exact_mut(samples_per_file) {
             mid_side_convert(file.chunks_exact_mut(2).map(|chunk| {
                 let (l, r) = chunk.split_at_mut(1);
@@ -282,10 +392,15 @@ fn phase_align(
     }
 
     let mut weights = vec![0f64; samples_per_file];
+    let mut filtered_weights = vec![0f64; samples_per_file];
 
     eprintln!("Weights:");
 
-    for (chan_idx, chan_weights) in weights.chunks_exact_mut(samples_per_channel).enumerate() {
+    for (chan_idx, (chan_weights, chan_weights_filtered)) in weights
+        .chunks_exact_mut(samples_per_channel)
+        .zip(filtered_weights.chunks_exact_mut(samples_per_channel))
+        .enumerate()
+    {
         let top_indices = calc_weights(
             fft_out_buf
                 .chunks_exact(samples_per_channel)
@@ -293,23 +408,25 @@ fn phase_align(
                 .step_by(num_channels),
             chan_weights,
             signal_spec,
-            weight_mode,
+            &config.weights,
         );
 
         let chan_name = ChanFmt {
             idx: chan_idx,
-            total: num_channels,
+            total: fmt_chan_count,
         };
 
         eprint!("  {chan_name}");
         if let Some(top_indices) = top_indices {
             eprintln!();
             for i in top_indices {
+                chan_weights_filtered[i] = chan_weights[i];
                 let bin_freq = signal_spec.rate as f64 * i as f64 / samples_per_channel as f64;
                 let weight = chan_weights[i];
                 eprintln!("    {bin_freq:.0}Hz: {weight}");
             }
         } else {
+            chan_weights_filtered.copy_from_slice(chan_weights);
             eprintln!(" (not printing as number of features is not limited)");
         }
     }
@@ -317,25 +434,26 @@ fn phase_align(
     let mut fft_chan_bufs = fft_out_buf.chunks_exact(samples_per_channel);
 
     let mut phases = Vec::with_capacity(num_files * num_channels);
-    let mut midpoints = vec![0.; num_channels];
+    let mut midpoints = Midpoints::new(num_channels, &config.midpoint_calc);
 
     'outer: loop {
-        for (chan_idx, midpoint) in midpoints.iter_mut().enumerate() {
+        for chan_idx in 0..num_channels {
             let Some(chan) = fft_chan_bufs.next() else {
                 break 'outer;
             };
             let phase = calc_phase_offset(
                 chan,
-                &weights[samples_per_channel * chan_idx..samples_per_channel * (chan_idx + 1)],
+                &filtered_weights
+                    [samples_per_channel * chan_idx..samples_per_channel * (chan_idx + 1)],
             );
 
             phases.push(phase);
 
-            *midpoint += phase / num_files as f64;
+            midpoints.add(chan_idx, phase);
         }
     }
 
-    eprintln!("Average phases: {midpoints:?}");
+    eprintln!("Average phase offset: {midpoints:?}");
 
     eprintln!();
     eprintln!("Time-domain errors (before alignment):");
@@ -371,7 +489,7 @@ fn phase_align(
             pre_errors.push(error);
             let chan_name = ChanFmt {
                 idx: channel,
-                total: num_channels,
+                total: fmt_chan_count,
             };
             eprintln!("    {chan_name} {error}")
         }
@@ -381,14 +499,31 @@ fn phase_align(
     let mut phases = phases.into_iter();
 
     'outer: loop {
-        for midpoint in &midpoints {
+        for chan_idx in 0..num_channels {
+            let midpoint = midpoints.get(chan_idx);
             let Some(chan) = fft_chan_bufs.next() else {
                 break 'outer;
             };
             let phase = phases.next().unwrap();
             let phase_diff = midpoint - phase;
 
-            apply_phase_offset(chan, phase_diff as _);
+            match config.realign_mask {
+                RealignMask::Weighted => {
+                    let weights = &weights
+                        [samples_per_channel * chan_idx..samples_per_channel * (chan_idx + 1)];
+
+                    apply_phase_offset(chan.iter_mut().zip(weights), phase_diff as _)
+                }
+                RealignMask::FeaturesOnly => {
+                    let weights = &filtered_weights
+                        [samples_per_channel * chan_idx..samples_per_channel * (chan_idx + 1)];
+
+                    apply_phase_offset(chan.iter_mut().zip(weights), phase_diff as _)
+                }
+                RealignMask::Transparent => {
+                    apply_phase_offset(chan.iter_mut().zip(std::iter::repeat(&1.)), phase_diff as _)
+                }
+            };
         }
     }
 
@@ -454,13 +589,13 @@ fn phase_align(
 
             let chan_name = ChanFmt {
                 idx: channel,
-                total: num_channels,
+                total: fmt_chan_count,
             };
             eprintln!("    {chan_name} {error} (delta: {delta}%)")
         }
     }
 
-    if num_channels == 2 {
+    if num_channels == 2 && matches!(config.process_mode, Some(TwoChannelProcessMode::MidSide)) {
         for file in concat_samples.chunks_exact_mut(samples_per_file) {
             mid_side_convert(file.chunks_exact_mut(2).map(|chunk| {
                 let (l, r) = chunk.split_at_mut(1);
@@ -534,7 +669,7 @@ impl Iterator for MultiCrossfader {
 
         self.cur_sample += 1;
 
-        // Equal-gain crossfade as buffers should be correlated
+        // Equal-gain crossfade as buffers are correlated
         Some(samples[0] * (1. - cross_perc) + samples[1] * cross_perc)
     }
 }
@@ -637,18 +772,23 @@ fn main() {
         &mut samples,
         num_files,
         spec,
-        &Weights {
-            freq: WeightStrategy {
-                in_range: 0f64..48000f64,
-                out_range: 0f64..1f64,
-                exp: 1.,
+        &AlignConfig {
+            weights: Weights {
+                freq: WeightStrategy {
+                    in_range: 0f64..48000f64,
+                    out_range: 0f64..1f64,
+                    exp: 1.,
+                },
+                radius: WeightStrategy {
+                    in_range: 0f64..4_196f64,
+                    out_range: 0f64..1f64,
+                    exp: 1.2,
+                },
+                limit_features: NonZeroUsize::new(8),
             },
-            radius: WeightStrategy {
-                in_range: 0f64..4_196f64,
-                out_range: 0f64..1f64,
-                exp: 1.2,
-            },
-            limit_features: NonZeroUsize::new(8),
+            realign_mask: RealignMask::Transparent,
+            midpoint_calc: ChannelCalc::OneChannel(0),
+            process_mode: Some(TwoChannelProcessMode::Stereo),
         },
     );
 
