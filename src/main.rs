@@ -201,13 +201,13 @@ fn phase_align(
             ..(samples_per_channel * (file * num_channels + channel + 1))
     }
 
-    fn get_channel<'a>(
-        concat_samples: &'a [f32],
+    fn get_channel(
+        concat_samples: &[f32],
         samples_per_file: usize,
         num_channels: usize,
         file: usize,
         channel: usize,
-    ) -> impl Iterator<Item = &'a f32> {
+    ) -> impl Iterator<Item = &'_ f32> {
         concat_samples[(samples_per_file * file)..(samples_per_file * (file + 1))]
             .iter()
             .skip(channel)
@@ -235,7 +235,7 @@ fn phase_align(
     // the phase alignment and then re-apply it afterwards
     let mins_maxs = concat_samples
         .chunks_exact(samples_per_file)
-        .map(|chunk| min_max(chunk))
+        .map(min_max)
         .collect::<Vec<_>>();
 
     let mut fft_in_buf = Vec::<Complex<f32>>::with_capacity(samples_per_channel);
@@ -468,7 +468,7 @@ where
 }
 
 fn remap_samples(samples: &mut [f32], out_min: f32, out_max: f32) {
-    let (min, max) = min_max(&samples);
+    let (min, max) = min_max(samples);
 
     for sample in samples {
         *sample = remap(*sample, min..max, out_min..out_max);
@@ -507,7 +507,7 @@ impl Iterator for MultiCrossfader {
             .map(|i| i.min(max_file_idx) * file_len + self.cur_sample % file_len);
         let samples = sample_indices.map(|i| samples[i]);
 
-        self.cur_sample = self.cur_sample + 1;
+        self.cur_sample += 1;
 
         // Equal-gain crossfade as buffers should be correlated
         Some(samples[0] * (1. - cross_perc) + samples[1] * cross_perc)
@@ -543,7 +543,7 @@ fn main() {
         .map(|stream| {
             probe
                 .format(
-                    &Hint::new().with_extension("flac"),
+                    Hint::new().with_extension("flac"),
                     stream,
                     &Default::default(),
                     &Default::default(),
@@ -564,7 +564,7 @@ fn main() {
     let mut samples = Vec::<f32>::new();
 
     for mut file in files {
-        let tracks = file.format.tracks().iter().cloned().collect::<Vec<_>>();
+        let tracks = file.format.tracks().to_vec();
         for track in tracks {
             num_files += 1;
 
@@ -651,7 +651,7 @@ fn main() {
 
     let stream_handle =
         rodio::OutputStreamBuilder::open_default_stream().expect("open default audio stream");
-    let sink = rodio::Sink::connect_new(&stream_handle.mixer());
+    let sink = rodio::Sink::connect_new(stream_handle.mixer());
 
     sink.append(source.automatic_gain_control(0.8, 0.01, 0.1, 0.99));
     sink.sleep_until_end();
