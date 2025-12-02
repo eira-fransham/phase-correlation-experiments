@@ -1,6 +1,7 @@
-use core::f32;
-use std::fs::File;
+use std::num::NonZeroUsize;
+use std::ops::{Add, Div, Mul, Sub};
 use std::time::Duration;
+use std::{fs::File, ops::Range};
 
 use rodio::source::Source;
 use rustfft::{FftPlanner, num_complex::Complex};
@@ -14,55 +15,154 @@ use symphonia::core::{
 /// AltarBoy loops have significant audible phasing without phase alignment,
 /// so act as a good test for the process
 const FILES: &[&str] = &[
-    "Saturn Loop -100",
-    "Saturn Loop -075",
-    "Saturn Loop -050",
-    "Saturn Loop -025",
-    "Saturn Loop 000",
-    "Saturn Loop +025",
-    "Saturn Loop +050",
-    "Saturn Loop +075",
-    "Saturn Loop +100",
+    "AltarBoy Loop -100",
+    "AltarBoy Loop -075",
+    "AltarBoy Loop -050",
+    "AltarBoy Loop -025",
+    "AltarBoy Loop 000",
+    "AltarBoy Loop +025",
+    "AltarBoy Loop +050",
+    "AltarBoy Loop +075",
+    "AltarBoy Loop +100",
 ];
 
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-enum RadiusWeight {
-    /// Weight = r^2, appears to produce the best results
-    #[default]
-    Pow,
-    /// Weight = r
-    Amp,
-    /// Weight = 1
-    One,
+struct WeightStrategy {
+    in_range: Range<f64>,
+    out_range: Range<f64>,
+    exp: f64,
+}
+
+impl WeightStrategy {
+    fn calc(&self, val: f64) -> f64 {
+        if self.exp == 0. {
+            return self.out_range.end;
+        }
+
+        let val = remap(val, self.in_range.clone(), 0f64..1f64).powf(self.exp);
+        let bound_a = f64::EPSILON.powf(self.exp);
+        let bound_b = 1f64.powf(self.exp);
+        let range = bound_a.min(bound_b)..bound_a.max(bound_b);
+
+        self.clamp(remap(val, range, self.out_range.clone()))
+    }
+
+    fn clamp(&self, val: f64) -> f64 {
+        let lower = self.out_range.start.min(self.out_range.end);
+        let higher = self.out_range.start.max(self.out_range.end);
+
+        val.clamp(lower, higher)
+    }
+}
+
+struct Weights {
+    freq: WeightStrategy,
+    radius: WeightStrategy,
+    /// The number of primary features to detect (if `None`, use all buckets)
+    limit_features: Option<NonZeroUsize>,
+}
+
+struct ChanFmt {
+    idx: usize,
+    total: usize,
+}
+
+impl std::fmt::Display for ChanFmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.total, self.idx) {
+            (1, _) => write!(f, "mono"),
+            (2, 0) => write!(f, "mid "),
+            (2, 1) => write!(f, "side"),
+            _ => write!(f, "ch{} ", self.idx),
+        }
+    }
 }
 
 /// Given a flat buffer of interleaved samples with a format given by `signal_spec`, align the
-/// phase of each audio buffer.
+/// phase of each audio buffer, using the feature detection parameters in `weight_mode`.
+///
+/// This processes the buffer as mid/side rather than left/right to prevent unwanted panning
+/// if the buffers end up more phased than before.
 fn phase_align(
     concat_samples: &mut [f32],
     num_files: usize,
     signal_spec: SignalSpec,
-    weight_mode: RadiusWeight,
+    weight_mode: &Weights,
 ) {
-    fn calc_weights(
-        fft: &[Complex<f32>],
-        num_files: usize,
-        sample_rate: u32,
-        weight_mode: RadiusWeight,
-        weights: &mut [f64],
-    ) {
-        for chan_buf in fft.chunks_exact(num_files) {
-            for ((i, src), dst) in chan_buf.iter().enumerate().zip(&mut *weights).skip(1) {
-                let bin_freq_seconds = fft.len() as f64 / (i as f64 * sample_rate as f64);
+    /// Either LR->MS or MS->LR, the function is its own inverse. Variable names
+    /// are chosen based on LR->MS.
+    fn mid_side_convert<'a>(frames: impl IntoIterator<Item = (&'a mut f32, &'a mut f32)>) {
+        for (l, r) in frames {
+            let mid = *l + *r;
+            let side = *l - *r;
 
-                let weight = match weight_mode {
-                    RadiusWeight::Pow => src.norm_sqr() as f64,
-                    RadiusWeight::Amp => src.norm() as f64,
-                    RadiusWeight::One => 1.,
-                };
-                *dst = weight * bin_freq_seconds;
+            *l = mid;
+            *r = side;
+        }
+    }
+
+    // fn rms_error_complex<'a>(
+    //     vals: impl IntoIterator<Item = (&'a Complex<f32>, &'a Complex<f32>)>,
+    // ) -> f32 {
+    //     let Complex { re: sum, im: count } = vals
+    //         .into_iter()
+    //         .map(|(a, b)| Complex::new((a - b).norm_sqr(), 1.))
+    //         .sum::<Complex<f32>>();
+    //     (sum / count).sqrt()
+    // }
+
+    fn rms_error_scalar<'a>(vals: impl IntoIterator<Item = (&'a f32, &'a f32)>) -> f32 {
+        let Complex { re: sum, im: count } = vals
+            .into_iter()
+            .map(|(a, b)| Complex::new((a - b).powi(2), 1.))
+            .sum::<Complex<f32>>();
+        (sum / count).sqrt()
+    }
+
+    /// Calculate weights, either for a single buffer or for a collection of buffers
+    fn calc_weights<'a>(
+        fft: impl IntoIterator<Item = &'a [Complex<f32>]>,
+        weights: &mut [f64],
+        signal_spec: SignalSpec,
+        weight_mode: &Weights,
+    ) -> Option<Vec<usize>> {
+        let mut zeroed = false;
+
+        for chan_buf in fft {
+            for ((i, src), dst) in chan_buf.iter().enumerate().zip(&mut *weights).skip(1) {
+                let bin_freq = signal_spec.rate as f64 * i as f64 / chan_buf.len() as f64;
+                let freq_weight = weight_mode.freq.calc(bin_freq);
+                let rad_weight = weight_mode.radius.calc(src.norm() as f64 * freq_weight);
+                if zeroed {
+                    *dst += rad_weight;
+                } else {
+                    *dst = rad_weight;
+                }
             }
+
+            zeroed = true;
+        }
+
+        if let Some(nth_highest) = weight_mode.limit_features
+            && nth_highest.get() < weights.len()
+        {
+            let mut indices = (0..weights.len()).collect::<Vec<_>>();
+
+            indices.sort_by(|a, b| {
+                weights[*a]
+                    .partial_cmp(&weights[*b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .reverse()
+            });
+
+            for i in &indices[nth_highest.get()..] {
+                weights[*i] = 0.;
+            }
+
+            indices.truncate(nth_highest.get());
+
+            Some(indices)
+        } else {
+            None
         }
     }
 
@@ -70,6 +170,7 @@ fn phase_align(
         let sum = fft
             .iter()
             .zip(weights)
+            .filter(|(_, weight)| **weight > 0.)
             .map(|(cartesian, weight)| {
                 let cartesian = Complex::new(cartesian.re as f64, cartesian.im as f64);
                 let theta = cartesian.arg();
@@ -83,27 +184,60 @@ fn phase_align(
         average_theta
     }
 
-    fn apply_phase_offset(fft: &mut [Complex<f32>], offset: f64) {
+    fn apply_phase_offset(fft: &mut [Complex<f32>], offset: f32) {
         for src_cartesian in fft {
-            let cartesian = Complex::new(src_cartesian.re as f64, src_cartesian.im as f64);
-            let (r, theta) = cartesian.to_polar();
-
-            let new_theta = theta + offset;
-
-            if !new_theta.is_finite() {
-                continue;
-            }
-
-            let new_cartesian = Complex::from_polar(r, new_theta);
-
-            src_cartesian.re = new_cartesian.re as f32;
-            src_cartesian.im = new_cartesian.im as f32;
+            let (r, theta) = src_cartesian.to_polar();
+            *src_cartesian = Complex::from_polar(r, theta + offset);
         }
+    }
+
+    fn out_range(
+        samples_per_channel: usize,
+        num_channels: usize,
+        file: usize,
+        channel: usize,
+    ) -> Range<usize> {
+        (samples_per_channel * (file * num_channels + channel))
+            ..(samples_per_channel * (file * num_channels + channel + 1))
+    }
+
+    fn get_channel<'a>(
+        concat_samples: &'a [f32],
+        samples_per_file: usize,
+        num_channels: usize,
+        file: usize,
+        channel: usize,
+    ) -> impl Iterator<Item = &'a f32> {
+        concat_samples[(samples_per_file * file)..(samples_per_file * (file + 1))]
+            .iter()
+            .skip(channel)
+            .step_by(num_channels)
     }
 
     let num_channels = signal_spec.channels.count();
     let samples_per_file = concat_samples.len() / num_files;
+
     let samples_per_channel = samples_per_file / num_channels;
+
+    if num_channels == 2 {
+        for file in concat_samples.chunks_exact_mut(samples_per_file) {
+            mid_side_convert(file.chunks_exact_mut(2).map(|chunk| {
+                let (l, r) = chunk.split_at_mut(1);
+                (&mut l[0], &mut r[0])
+            }));
+        }
+    } else {
+        eprintln!("Could not do mid/side conversion as input is not stereo");
+    }
+
+    // Phase alignment can cause extreme volume changes for some reason. This is probably
+    // resolvable without this hack, but for now we just calculate the min/max before
+    // the phase alignment and then re-apply it afterwards
+    let mins_maxs = concat_samples
+        .chunks_exact(samples_per_file)
+        .map(|chunk| min_max(chunk))
+        .collect::<Vec<_>>();
+
     let mut fft_in_buf = Vec::<Complex<f32>>::with_capacity(samples_per_channel);
     let mut fft_out_buf = vec![Complex::<f32>::default(); concat_samples.len()];
 
@@ -117,15 +251,17 @@ fn phase_align(
         for channel in 0..num_channels {
             fft_in_buf.clear();
             fft_in_buf.extend(
-                concat_samples[(samples_per_file * file)..(samples_per_file * (file + 1))]
-                    .iter()
-                    .skip(channel)
-                    .step_by(num_channels)
-                    .map(|sample| Complex::new(*sample, 0.)),
+                get_channel(
+                    concat_samples,
+                    samples_per_file,
+                    num_channels,
+                    file,
+                    channel,
+                )
+                .map(|sample| Complex::new(*sample, 0.)),
             );
 
-            let out_range = (samples_per_channel * (file * num_channels + channel))
-                ..(samples_per_channel * (file * num_channels + channel + 1));
+            let out_range = out_range(samples_per_channel, num_channels, file, channel);
             fft.process_outofplace_with_scratch(
                 &mut fft_in_buf,
                 &mut fft_out_buf[out_range],
@@ -134,62 +270,115 @@ fn phase_align(
         }
     }
 
-    let mut weights = vec![0f64; samples_per_channel];
+    let mut weights = vec![0f64; samples_per_file];
 
-    calc_weights(
-        &fft_out_buf,
-        num_files,
-        signal_spec.rate,
-        weight_mode,
-        &mut weights,
-    );
+    eprintln!("Weights:");
+
+    for (chan_idx, chan_weights) in weights.chunks_exact_mut(samples_per_channel).enumerate() {
+        let top_indices = calc_weights(
+            fft_out_buf
+                .chunks_exact(samples_per_channel)
+                .skip(chan_idx)
+                .step_by(num_channels),
+            chan_weights,
+            signal_spec,
+            weight_mode,
+        );
+
+        let chan_name = ChanFmt {
+            idx: chan_idx,
+            total: num_channels,
+        };
+
+        eprint!("  {chan_name}");
+        if let Some(top_indices) = top_indices {
+            eprintln!();
+            for i in top_indices {
+                let bin_freq = signal_spec.rate as f64 * i as f64 / samples_per_channel as f64;
+                let weight = chan_weights[i];
+                eprintln!("    {bin_freq:.0}Hz: {weight}");
+            }
+        } else {
+            eprintln!(" (not printing as number of features is not limited)");
+        }
+    }
 
     let mut fft_chan_bufs = fft_out_buf.chunks_exact(samples_per_channel);
 
-    let mut phases = Vec::with_capacity(num_files);
-    let mut offset_accumulator: f64 = 0.;
+    let mut phases = Vec::with_capacity(num_files * num_channels);
+    let mut midpoints = vec![0.; num_channels];
 
-    loop {
-        let Some(left) = fft_chan_bufs.next() else {
-            break;
-        };
-        let right = fft_chan_bufs.next().unwrap();
+    'outer: loop {
+        for (chan_idx, midpoint) in midpoints.iter_mut().enumerate() {
+            let Some(chan) = fft_chan_bufs.next() else {
+                break 'outer;
+            };
+            let phase = calc_phase_offset(
+                chan,
+                &weights[samples_per_channel * chan_idx..samples_per_channel * (chan_idx + 1)],
+            );
 
-        let left_phase = calc_phase_offset(left, &weights);
-        let right_phase = calc_phase_offset(right, &weights);
+            phases.push(phase);
 
-        let avg_phase = (left_phase + right_phase) / 2.;
-
-        phases.push(avg_phase);
-
-        offset_accumulator += avg_phase;
+            *midpoint += phase / num_files as f64;
+        }
     }
 
-    let midpoint_phase_offset = offset_accumulator / num_files as f64;
+    eprintln!("Average phases: {midpoints:?}");
 
-    eprintln!("Average phase: {midpoint_phase_offset}");
+    eprintln!();
+    eprintln!("Time-domain errors (before alignment):");
+
+    let mut pre_errors = Vec::<f32>::with_capacity((num_files - 1) * num_channels);
+
+    for file in 0..num_files - 1 {
+        eprintln!("  f{}/f{}:", file, file + 1);
+        for channel in 0..num_channels {
+            let error = rms_error_scalar(
+                get_channel(
+                    concat_samples,
+                    samples_per_file,
+                    num_channels,
+                    file,
+                    channel,
+                )
+                .zip(get_channel(
+                    concat_samples,
+                    samples_per_file,
+                    num_channels,
+                    file + 1,
+                    channel,
+                )),
+            );
+            pre_errors.push(error);
+            let chan_name = ChanFmt {
+                idx: channel,
+                total: num_channels,
+            };
+            eprintln!("    {chan_name} {error}")
+        }
+    }
 
     let mut fft_chan_bufs = fft_out_buf.chunks_exact_mut(samples_per_channel);
     let mut phases = phases.into_iter();
 
-    loop {
-        let Some(left) = fft_chan_bufs.next() else {
-            break;
-        };
-        let right = fft_chan_bufs.next().unwrap();
-        let phase = phases.next().unwrap();
-        let phase_diff = midpoint_phase_offset - phase;
+    'outer: loop {
+        for midpoint in &midpoints {
+            let Some(chan) = fft_chan_bufs.next() else {
+                break 'outer;
+            };
+            let phase = phases.next().unwrap();
+            let phase_diff = midpoint - phase;
 
-        apply_phase_offset(left, phase_diff);
-        apply_phase_offset(right, phase_diff);
+            apply_phase_offset(chan, phase_diff as _);
+        }
     }
 
     ifft.process_with_scratch(&mut fft_out_buf, &mut scratch);
 
     for file in 0..num_files {
         for channel in 0..num_channels {
-            let out_range = (samples_per_channel * (file * num_channels + channel))
-                ..(samples_per_channel * (file * num_channels + channel + 1));
+            let out_range = out_range(samples_per_channel, num_channels, file, channel);
 
             for (dst, src) in concat_samples
                 [(samples_per_file * file)..(samples_per_file * (file + 1))]
@@ -201,6 +390,60 @@ fn phase_align(
                 *dst = src.re;
             }
         }
+    }
+
+    // Remap each buffer back to its original range after phase alignment
+    for (file, (min, max)) in concat_samples
+        .chunks_exact_mut(samples_per_file)
+        .zip(mins_maxs)
+    {
+        remap_samples(file, min, max);
+    }
+
+    eprintln!();
+    eprintln!("Time-domain errors (after alignment):");
+
+    let mut pre_errors = pre_errors.into_iter();
+
+    for file in 0..num_files - 1 {
+        eprintln!("  f{}/f{}", file, file + 1);
+        for channel in 0..num_channels {
+            let error = rms_error_scalar(
+                get_channel(
+                    concat_samples,
+                    samples_per_file,
+                    num_channels,
+                    file,
+                    channel,
+                )
+                .zip(get_channel(
+                    concat_samples,
+                    samples_per_file,
+                    num_channels,
+                    file + 1,
+                    channel,
+                )),
+            );
+            let pre_error = pre_errors.next().unwrap();
+            let delta = 100. * (error - pre_error) / pre_error;
+
+            let chan_name = ChanFmt {
+                idx: channel,
+                total: num_channels,
+            };
+            eprintln!("    {chan_name} {error} (delta: {delta}%)")
+        }
+    }
+
+    if num_channels == 2 {
+        for file in concat_samples.chunks_exact_mut(samples_per_file) {
+            mid_side_convert(file.chunks_exact_mut(2).map(|chunk| {
+                let (l, r) = chunk.split_at_mut(1);
+                (&mut l[0], &mut r[0])
+            }));
+        }
+    } else {
+        eprintln!("Could not do left/right conversion as input is not stereo");
     }
 }
 
@@ -216,12 +459,19 @@ fn min_max(buf: &[f32]) -> (f32, f32) {
     (min, max)
 }
 
-fn remap_range(samples: &mut [f32], out_min: f32, out_max: f32) {
+fn remap<T>(val: T, from: Range<T>, to: Range<T>) -> T
+where
+    T: Copy + Sub<Output = T> + Div<Output = T> + Mul<Output = T> + Add<Output = T>,
+{
+    let remap_zero_one = (val - from.start) / (from.end - from.start);
+    (remap_zero_one * (to.end - to.start)) + to.start
+}
+
+fn remap_samples(samples: &mut [f32], out_min: f32, out_max: f32) {
     let (min, max) = min_max(&samples);
 
     for sample in samples {
-        let remap_zero_one = (*sample - min) / (max - min);
-        *sample = (remap_zero_one * (out_max - out_min)) + out_min;
+        *sample = remap(*sample, min..max, out_min..out_max);
     }
 }
 
@@ -345,8 +595,6 @@ fn main() {
         }
     }
 
-    let samples_per_file = samples.len() / num_files;
-
     if let Err(e) = rodio::output_to_wav(
         &mut MultiCrossfader {
             concat_samples: samples.clone(),
@@ -360,20 +608,24 @@ fn main() {
         eprintln!("Error while writing unaligned wav: {e}");
     }
 
-    // Phase alignment can cause extreme volume changes for some reason. This is probably
-    // resolvable without this hack, but for now we just calculate the min/max before
-    // the phase alignment and then re-apply it afterwards
-    let mins_maxs = samples
-        .chunks_exact(samples_per_file)
-        .map(|chunk| min_max(chunk))
-        .collect::<Vec<_>>();
-
-    phase_align(&mut samples, num_files, spec, RadiusWeight::Pow);
-
-    // Remap each buffer back to its original range after phase alignment
-    for (file, (min, max)) in samples.chunks_exact_mut(samples_per_file).zip(mins_maxs) {
-        remap_range(file, min, max);
-    }
+    phase_align(
+        &mut samples,
+        num_files,
+        spec,
+        &Weights {
+            freq: WeightStrategy {
+                in_range: 0f64..48000f64,
+                out_range: 0f64..1f64,
+                exp: 1.,
+            },
+            radius: WeightStrategy {
+                in_range: 0f64..4_196f64,
+                out_range: 0f64..1f64,
+                exp: 1.2,
+            },
+            limit_features: NonZeroUsize::new(8),
+        },
+    );
 
     if let Err(e) = rodio::output_to_wav(
         &mut MultiCrossfader {
