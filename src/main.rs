@@ -804,7 +804,7 @@ fn main() {
             },
             realign_mask: RealignMask::Transparent,
             midpoint_calc: ChannelCalc::OneChannel(0),
-            process_mode: Some(TwoChannelProcessMode::Stereo),
+            process_mode: Some(TwoChannelProcessMode::MidSide),
         },
     );
 
