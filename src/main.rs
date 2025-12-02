@@ -110,10 +110,21 @@ fn phase_align(
     //     (sum / count).sqrt()
     // }
 
-    fn rms_error_scalar<'a>(vals: impl IntoIterator<Item = (&'a f32, &'a f32)>) -> f32 {
+    fn rms_error_scalar<'a>(
+        vals: impl IntoIterator<Item = (&'a f32, &'a f32)>,
+        range_left: &Range<f32>,
+        range_right: &Range<f32>,
+    ) -> f32 {
+        let target_range = 0f32..1f32;
+
         let Complex { re: sum, im: count } = vals
             .into_iter()
-            .map(|(a, b)| Complex::new((a - b).powi(2), 1.))
+            .map(|(a, b)| {
+                let a = remap(*a, range_left.clone(), target_range.clone());
+                let b = remap(*b, range_right.clone(), target_range.clone());
+                // TODO: Somewhat janky way to
+                Complex::new((a - b).powi(2), 1.)
+            })
             .sum::<Complex<f32>>();
         (sum / count).sqrt()
     }
@@ -332,6 +343,11 @@ fn phase_align(
     let mut pre_errors = Vec::<f32>::with_capacity((num_files - 1) * num_channels);
 
     for file in 0..num_files - 1 {
+        let (cur_min, cur_max) = mins_maxs[file];
+        let (next_min, next_max) = mins_maxs[file + 1];
+        let cur_range = cur_min..cur_max;
+        let next_range = next_min..next_max;
+
         eprintln!("  f{}/f{}:", file, file + 1);
         for channel in 0..num_channels {
             let error = rms_error_scalar(
@@ -349,6 +365,8 @@ fn phase_align(
                     file + 1,
                     channel,
                 )),
+                &cur_range,
+                &next_range,
             );
             pre_errors.push(error);
             let chan_name = ChanFmt {
@@ -395,9 +413,9 @@ fn phase_align(
     // Remap each buffer back to its original range after phase alignment
     for (file, (min, max)) in concat_samples
         .chunks_exact_mut(samples_per_file)
-        .zip(mins_maxs)
+        .zip(&mins_maxs)
     {
-        remap_samples(file, min, max);
+        remap_samples(file, *min, *max);
     }
 
     eprintln!();
@@ -406,6 +424,11 @@ fn phase_align(
     let mut pre_errors = pre_errors.into_iter();
 
     for file in 0..num_files - 1 {
+        let (cur_min, cur_max) = mins_maxs[file];
+        let (next_min, next_max) = mins_maxs[file + 1];
+        let cur_range = cur_min..cur_max;
+        let next_range = next_min..next_max;
+
         eprintln!("  f{}/f{}", file, file + 1);
         for channel in 0..num_channels {
             let error = rms_error_scalar(
@@ -423,6 +446,8 @@ fn phase_align(
                     file + 1,
                     channel,
                 )),
+                &cur_range,
+                &next_range,
             );
             let pre_error = pre_errors.next().unwrap();
             let delta = 100. * (error - pre_error) / pre_error;
